@@ -1091,162 +1091,92 @@ def late_arrival_leaderboard(
 @app.get("/analytics/departments/{department}/trend")
 def department_attendance_trend(
     department: str,
-    date_from: date,
-    date_to: date,
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
 ):
-    if date_from > date_to:
-        raise HTTPException(
-            status_code=422,
-            detail="date_from cannot be after date_to",
-        )
+    if to_date < from_date:
+        raise HTTPException(status_code=422, detail="to cannot be before from")
 
-    if (date_to - date_from).days > 365:
-        raise HTTPException(
-            status_code=422,
-            detail="Date range cannot exceed 366 days",
-        )
+    if (to_date - from_date).days + 1 > 92:
+        raise HTTPException(status_code=422, detail="Date range cannot exceed 92 days")
 
     try:
+        if employees.count_documents({"department": department}) == 0:
+            raise HTTPException(status_code=404, detail="Unknown department")
+
         pipeline = [
-            {
-                "$match": {
-                    "date": {
-                        "$gte": date_from.isoformat(),
-                        "$lte": date_to.isoformat(),
-                    }
-                }
-            },
-            {
-                "$lookup": {
-                    "from": employees.name,
-                    "localField": "emp_code",
-                    "foreignField": "emp_code",
-                    "as": "employee",
-                }
-            },
+            {"$match": {"date": {"$gte": from_date.isoformat(), "$lte": to_date.isoformat()}}},
+            {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "employee"}},
             {"$unwind": "$employee"},
             {"$match": {"employee.department": department}},
-            
-{"$set": {"trend_date": {"$dateFromString": {"dateString": "$date"}}}},
-
-            {
-                "$group": {
-                    "_id": "$trend_date",
-                    "present_days": {
-                        "$sum": {
-                            "$cond": [
-                                {
-                                    "$and": [
-                                        {
-                                            "$in": [
-                                                "$status",
-                                                ["PRESENT", "WFH", "ON_DUTY"],
-                                            ]
-                                        },
-                                        {
-                                            "$in": [
-                                                {
-                                                    "$dayOfWeek": {
-                                                        "$dateFromString": {
-                                                            "dateString": "$date"
-                                                        }
-                                                    }
-                                                },
-                                                [2, 3, 4, 5, 6],
-                                            ]
-                                        },
-                                    ]
-                                },
-                                {
-                                    "$cond": [
-                                        {"$eq": ["$half_day", True]},
-                                        0.5,
-                                        1,
-                                    ]
-                                },
-                                0,
-                            ]
-                        }
-                    },
-                    "late_minutes": {"$sum": "$late_minutes"},
-                    "overtime_minutes": {"$sum": "$overtime_minutes"},
-                }
-            },
-            {
-                "$densify": {
-                    "field": "_id",
-                    "range": {
-                        "step": 1,
-                        "unit": "day",
-                        "bounds": [
-                             datetime.combine(date_from, datetime.min.time()),
-                             datetime.combine(date_to + timedelta(days=1), datetime.min.time()),
-                        ],
-                    },
-                }
-            },
-            {
-                "$fill": {
-                    "output": {
-                        "present_days": {"value": 0},
-                        "late_minutes": {"value": 0},
-                        "overtime_minutes": {"value": 0},
-                    }
-                }
-            },
-            {"$sort": {"_id": 1}},
-            {
-                "$setWindowFields": {
-                    "sortBy": {"_id": 1},
-                    "output": {
-                        "moving_average_7d": {
-                            "$avg": "$present_days",
-                            "window": {"documents": [-6, 0]},
-                        }
-                    },
-                }
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "date": {
-                        "$dateToString": {
-                            "format": "%Y-%m-%d",
-                            "date": "$_id",
-                        }
-                    },
-                    "present_days": 1,
-                    "late_minutes": 1,
-                    "overtime_minutes": 1,
-                    "moving_average_7d": {
-                        "$round": ["$moving_average_7d", 2]
-                    },
-                }
-            },
+            {"$set": {
+                "_day": {"$dateFromString": {"dateString": "$date"}},
+                "_presence": {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+            }},
+            {"$group": {
+                "_id": "$_day",
+                "present_count": {"$sum": {"$cond": [
+                    "$_presence", {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]}, 0
+                ]}},
+                "late_count": {"$sum": {"$cond": [
+                    {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0
+                ]}},
+            }},
+            {"$densify": {"field": "_id", "range": {
+                "step": 1, "unit": "day",
+                "bounds": [
+                    datetime.combine(from_date, datetime.min.time()),
+                    datetime.combine(to_date + timedelta(days=1), datetime.min.time()),
+                ],
+            }}},
+            {"$fill": {"output": {"present_count": {"value": 0}, "late_count": {"value": 0}}}},
+            {"$set": {
+                "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$_id"}},
+                "weekday": {"$dayOfWeek": "$_id"},
+            }},
+            {"$lookup": {"from": "employees", "let": {"day": "$date"}, "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$department", department]},
+                    {"$lte": ["$joined_on", "$$day"]},
+                ]}}},
+                {"$count": "count"},
+            ], "as": "hc"}},
+            {"$set": {
+                "headcount": {"$ifNull": [{"$arrayElemAt": ["$hc.count", 0]}, 0]},
+                "is_working_day": {"$and": [
+                    {"$gte": ["$weekday", 2]}, {"$lte": ["$weekday", 6]}
+                ]},
+            }},
+            {"$set": {"attendance_rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                {"$round": [{"$divide": ["$present_count", "$headcount"]}, 4]},
+                None,
+            ]}}},
+            {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {
+                "moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}
+            }}},
+            {"$project": {
+                "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1,
+                "present_count": 1, "late_count": 1, "attendance_rate": 1,
+                "moving_avg_7d": {"$round": ["$moving_avg_7d", 4]},
+            }},
+            {"$sort": {"date": 1}},
         ]
 
-        # Use a UTC date value for densify so the generated daily range is consistent.
-        # pipeline[5]["$densify"]["range"]["bounds"] = [
-        #     datetime.combine(date_from, datetime.min.time()),
-        #     datetime.combine(date_to + timedelta(days=1), datetime.min.time()),
-        # ]
+        items = list(attendance_logs.aggregate(pipeline))
+        for item in items:
+            for key in ("attendance_rate", "moving_avg_7d"):
+                if item.get(key) is not None:
+                    item[key] = float(Decimal(str(item[key])).quantize(
+                        Decimal("0.0001"), rounding=ROUND_HALF_UP
+                    ))
 
-        results = list(attendance_logs.aggregate(pipeline))
+        return {"department": department, "items": items}
 
-        return {
-            "department": department,
-            "date_from": date_from.isoformat(),
-            "date_to": date_to.isoformat(),
-            "trend": results,
-        }
+    except PyMongoError:
+        raise HTTPException(status_code=503, detail="Database operation failed")
 
-    except PyMongoError as exc:
-        print("TREND ERROR TYPE:", type(exc).__name__)
-        print("TREND ERROR MESSAGE:", str(exc))
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc),
-        )
+
 @app.get("/admin/explain/{endpoint}")
 def explain_query_plan(endpoint: str):
     allowed_endpoints = {

@@ -1,4 +1,4 @@
-# HROne Employee Attendance & Analytics API
+﻿# HROne Employee Attendance & Analytics API
 
 A REST API built with Python, FastAPI, and MongoDB for employee management, attendance tracking, attendance regularization, and attendance analytics.
 
@@ -27,7 +27,7 @@ A REST API built with Python, FastAPI, and MongoDB for employee management, atte
 Replace the example URL and folder name with your actual public GitHub repository details.
 
 ```bash
-git clone YOUR_PUBLIC_GITHUB_REPOSITORY_URL
+git clone https://github.com/shubhamHaral/HROne-Attendance-API.git
 cd YOUR_REPOSITORY_FOLDER
 ```
 
